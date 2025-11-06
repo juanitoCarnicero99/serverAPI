@@ -3,73 +3,72 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const sqlite3 = require('sqlite3').verbose();
+const mysql = require('mysql2/promise');
 const bcrypt = require('bcrypt');
-const { Pool } = require('pg');
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
 
-// DB selection: prefer Postgres if DATABASE_URL provided, otherwise SQLite for local dev
-const isPg = !!process.env.DATABASE_URL;
-let db = null; // sqlite db instance
-let pool = null; // pg pool
+// MySQL connection pool
+let pool = null;
 
-if (isPg) {
-  pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DB_SSL === 'disable' ? false : { rejectUnauthorized: false } });
-  // If a Postgres DDL file exists, try to run it (best-effort). Otherwise expect migrations to be run manually.
-  const ddlPath = path.join(__dirname, '001_create_users_table.sql');
-  if (fs.existsSync(ddlPath)) {
-    const ddl = fs.readFileSync(ddlPath, 'utf8');
-    pool.query(ddl).then(()=> console.log('DDL applied (Postgres)')).catch(err=>console.log('Postgres DDL not applied (may already exist):', err.message));
-  } else {
-    console.log('No Postgres DDL found; ensure your database has the users table.');
+async function initializeDatabase() {
+  try {
+    pool = mysql.createPool({
+      host: process.env.DB_HOST || 'localhost',
+      port: process.env.DB_PORT || 3306,
+      user: process.env.DB_USER || 'root',
+      password: process.env.DB_PASSWORD || '',
+      database: process.env.DB_NAME || 'flutter_mvc_login',
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0
+    });
+
+    // Test connection
+    const connection = await pool.getConnection();
+    console.log('✓ Conexión exitosa a MySQL');
+    connection.release();
+
+    // Try to apply DDL if exists
+    const ddlPath = path.join(__dirname, '001_create_users_table_mysql.sql');
+    if (fs.existsSync(ddlPath)) {
+      try {
+        const ddl = fs.readFileSync(ddlPath, 'utf8');
+        // Split by semicolon to handle multiple statements
+        const statements = ddl.split(';').filter(s => s.trim().length > 0);
+        for (const statement of statements) {
+          await pool.query(statement);
+        }
+        console.log('✓ DDL aplicado (MySQL)');
+      } catch (err) {
+        console.log('⚠ DDL no aplicado (puede que ya exista):', err.message);
+      }
+    } else {
+      console.log('⚠ No se encontró DDL de MySQL; asegúrate de que tu base de datos tenga la tabla users.');
+    }
+  } catch (err) {
+    console.error('✗ Error al conectar a MySQL:', err.message);
+    process.exit(1);
   }
-} else {
-  // Ubicación de la base de datos SQLite para pruebas locales
-  const DB_FILE = path.join(__dirname, 'data.db');
-  db = new sqlite3.Database(DB_FILE);
-
-  // Crear tabla equivalente para SQLite si no existe (para pruebas locales).
-  const createTableSql = `
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    apodo TEXT NOT NULL,
-    contrasena_hash TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    nombre TEXT,
-    apellido TEXT,
-    fecha_nacimiento TEXT,
-    carrera TEXT,
-    descripcion_personal TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  `;
-
-  db.serialize(() => {
-    db.run(createTableSql);
-    db.run("CREATE INDEX IF NOT EXISTS idx_users_apodo ON users(apodo);");
-    db.run("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);");
-  });
 }
 
-// Generic async DB helpers (work with either pg Pool or sqlite3)
-function dbGet(sql, params=[]) {
-  if (isPg) return pool.query(sql, params).then(r=> r.rows[0]);
-  return new Promise((resolve, reject) => db.get(sql, params, (err, row) => err ? reject(err) : resolve(row)));
+// Generic async DB helpers for MySQL
+async function dbGet(sql, params = []) {
+  const [rows] = await pool.query(sql, params);
+  return rows[0];
 }
 
-function dbAll(sql, params=[]) {
-  if (isPg) return pool.query(sql, params).then(r=> r.rows);
-  return new Promise((resolve, reject) => db.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows)));
+async function dbAll(sql, params = []) {
+  const [rows] = await pool.query(sql, params);
+  return rows;
 }
 
-function dbRun(sql, params=[]) {
-  if (isPg) return pool.query(sql, params);
-  return new Promise((resolve, reject) => db.run(sql, params, function(err) { if (err) reject(err); else resolve(this); }));
+async function dbRun(sql, params = []) {
+  const [result] = await pool.query(sql, params);
+  return result;
 }
 
 function sanitizeUserRow(row) {
@@ -106,12 +105,7 @@ app.post('/login', async (req, res) => {
   }
 
   try {
-    let row;
-    if (isPg) {
-      row = await dbGet('SELECT * FROM users WHERE apodo = $1 OR email = $1', [username]);
-    } else {
-      row = await dbGet('SELECT * FROM users WHERE apodo = ? OR email = ?', [username, username]);
-    }
+    const row = await dbGet('SELECT * FROM users WHERE apodo = ? OR email = ?', [username, username]);
     if (!row) return res.status(401).json({ success: false, message: 'Credenciales inválidas' });
 
     const ok = await comparePassword(password, row.contrasena_hash);
@@ -131,30 +125,16 @@ app.post('/users', async (req, res) => {
 
   try {
     const hash = await hashPassword(b.contrasena);
-    if (isPg) {
-      const sql = `INSERT INTO users (apodo, contrasena_hash, email, nombre, apellido, fecha_nacimiento, carrera, descripcion_personal) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`;
-      const vals = [b.apodo, hash, b.email, b.nombre || null, b.apellido || null, b.fecha_nacimiento || null, b.carrera || null, b.descripcion_personal || null];
-      try {
-        const r = await pool.query(sql, vals);
-        return res.status(201).json({ success: true, user: sanitizeUserRow(r.rows[0]) });
-      } catch (err) {
-        if (err.code === '23505' || (err.message && err.message.includes('unique'))) {
-          return res.status(409).json({ success: false, message: 'Email o apodo ya existe' });
-        }
-        return res.status(500).json({ success: false, message: 'DB error', error: err.message });
+    const sql = `INSERT INTO users (apodo, contrasena_hash, email, nombre, apellido, fecha_nacimiento, carrera, descripcion_personal) VALUES (?,?,?,?,?,?,?,?)`;
+    try {
+      const result = await dbRun(sql, [b.apodo, hash, b.email, b.nombre || null, b.apellido || null, b.fecha_nacimiento || null, b.carrera || null, b.descripcion_personal || null]);
+      const row = await dbGet('SELECT * FROM users WHERE id = ?', [result.insertId]);
+      return res.status(201).json({ success: true, user: sanitizeUserRow(row) });
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY' || (err.message && err.message.includes('Duplicate'))) {
+        return res.status(409).json({ success: false, message: 'Email o apodo ya existe' });
       }
-    } else {
-      const sql = `INSERT INTO users (apodo, contrasena_hash, email, nombre, apellido, fecha_nacimiento, carrera, descripcion_personal) VALUES (?,?,?,?,?,?,?,?)`;
-      try {
-        const info = await dbRun(sql, [b.apodo, hash, b.email, b.nombre || null, b.apellido || null, b.fecha_nacimiento || null, b.carrera || null, b.descripcion_personal || null]);
-        const row = await dbGet('SELECT * FROM users WHERE id = ?', [info.lastID]);
-        return res.status(201).json({ success: true, user: sanitizeUserRow(row) });
-      } catch (err) {
-        if (err.message && err.message.includes('UNIQUE')) {
-          return res.status(409).json({ success: false, message: 'Email o apodo ya existe' });
-        }
-        return res.status(500).json({ success: false, message: 'DB error', error: err.message });
-      }
+      return res.status(500).json({ success: false, message: 'DB error', error: err.message });
     }
   } catch (e) {
     return res.status(500).json({ success: false, message: e.message });
@@ -177,15 +157,9 @@ app.get('/users', async (req, res) => {
 app.get('/users/:id', async (req, res) => {
   const id = req.params.id;
   try {
-    if (isPg) {
-      const row = await dbGet('SELECT * FROM users WHERE id = $1', [id]);
-      if (!row) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
-      return res.json({ success: true, user: sanitizeUserRow(row) });
-    } else {
-      const row = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
-      if (!row) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
-      return res.json({ success: true, user: sanitizeUserRow(row) });
-    }
+    const row = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
+    if (!row) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
+    return res.json({ success: true, user: sanitizeUserRow(row) });
   } catch (err) {
     return res.status(500).json({ success: false, message: 'DB error', error: err.message });
   }
@@ -197,7 +171,7 @@ app.put('/users/:id', async (req, res) => {
   const b = req.body || {};
   try {
     // ensure exists
-    const existing = await (isPg ? dbGet('SELECT * FROM users WHERE id = $1', [id]) : dbGet('SELECT * FROM users WHERE id = ?', [id]));
+    const existing = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
     if (!existing) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
 
     // Build update
@@ -206,49 +180,27 @@ app.put('/users/:id', async (req, res) => {
     const allowed = ['apodo','email','nombre','apellido','fecha_nacimiento','carrera','descripcion_personal'];
     for (const k of allowed) {
       if (k in b) {
-        if (isPg) {
-          fields.push(`${k} = $${values.length + 1}`);
-        } else {
-          fields.push(`${k} = ?`);
-        }
+        fields.push(`${k} = ?`);
         values.push(b[k]);
       }
     }
     if (b.contrasena) {
       const h = await hashPassword(b.contrasena);
-      if (isPg) {
-        fields.push(`contrasena_hash = $${values.length + 1}`);
-      } else {
-        fields.push('contrasena_hash = ?');
-      }
+      fields.push('contrasena_hash = ?');
       values.push(h);
     }
     if (fields.length === 0) return res.status(400).json({ success: false, message: 'Nada que actualizar' });
 
     // updated_at
-    if (isPg) {
-      fields.push(`updated_at = $${values.length + 1}`);
-    } else {
-      fields.push('updated_at = ?');
-    }
+    fields.push('updated_at = ?');
     values.push(new Date().toISOString());
 
     // WHERE id param
-    let sql;
-    if (isPg) {
-      // need to put id as last param
-      sql = `UPDATE users SET ${fields.join(', ')} WHERE id = $${values.length+1}`;
-      values.push(id);
-      await pool.query(sql, values);
-      const row = await dbGet('SELECT * FROM users WHERE id = $1', [id]);
-      return res.json({ success: true, user: sanitizeUserRow(row) });
-    } else {
-      sql = `UPDATE users SET ${fields.join(', ')} WHERE id = ?`;
-      values.push(id);
-      await dbRun(sql, values);
-      const row = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
-      return res.json({ success: true, user: sanitizeUserRow(row) });
-    }
+    const sql = `UPDATE users SET ${fields.join(', ')} WHERE id = ?`;
+    values.push(id);
+    await dbRun(sql, values);
+    const row = await dbGet('SELECT * FROM users WHERE id = ?', [id]);
+    return res.json({ success: true, user: sanitizeUserRow(row) });
   } catch (err) {
     return res.status(500).json({ success: false, message: 'DB error', error: err.message });
   }
@@ -258,15 +210,9 @@ app.put('/users/:id', async (req, res) => {
 app.delete('/users/:id', async (req, res) => {
   const id = req.params.id;
   try {
-    if (isPg) {
-      const r = await pool.query('DELETE FROM users WHERE id = $1', [id]);
-      if (r.rowCount === 0) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
-      return res.json({ success: true, message: 'Usuario eliminado' });
-    } else {
-      const info = await dbRun('DELETE FROM users WHERE id = ?', [id]);
-      if (info.changes === 0) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
-      return res.json({ success: true, message: 'Usuario eliminado' });
-    }
+    const result = await dbRun('DELETE FROM users WHERE id = ?', [id]);
+    if (result.affectedRows === 0) return res.status(404).json({ success: false, message: 'Usuario no encontrado' });
+    return res.json({ success: true, message: 'Usuario eliminado' });
   } catch (err) {
     return res.status(500).json({ success: false, message: 'DB error', error: err.message });
   }
@@ -462,6 +408,9 @@ app.get('/ui', (req, res) => {
   `);
 });
 
-app.listen(port, () => {
-  console.log(`Auth API escuchando en http://localhost:${port}`);
+// Initialize database and start server
+initializeDatabase().then(() => {
+  app.listen(port, () => {
+    console.log(`Auth API escuchando en http://localhost:${port}`);
+  });
 });

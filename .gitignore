@@ -1,0 +1,28 @@
+# Node
+node_modules/
+server/node_modules/
+
+# Environment files
+.env
+.env.*
+
+# Local DB
+server/data.db
+
+# Logs
+*.log
+server/server_log.txt
+server/server_err.txt
+
+# Editor/OS
+.vscode/
+.DS_Store
+
+# Build / cache
+build/
+test_cache/
+unit_test_assets/
+
+# Others
+*.tgz
+coverage/
